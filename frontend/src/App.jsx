@@ -47,7 +47,6 @@ export default function App() {
   });
 
   const [filters, setFilters] = useState([newRow('RecordId__c')]);
-  const [query, setQuery] = useState(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [result, setResult] = useState(null);
@@ -60,6 +59,10 @@ export default function App() {
   // Toast message
   const [toast, setToast] = useState('');
   const toastTimer = useRef(null);
+
+  const logDebug = (...args) => {
+    console.debug('[LogSphere]', ...args);
+  };
 
   const showToast = (msg) => {
     setToast(msg);
@@ -123,39 +126,64 @@ export default function App() {
     setFilters([newRow(defaultField)]);
   };
 
-  // Execute Search
-  useEffect(() => {
-    if (!query) return;
-    const ctrl = new AbortController();
+  const executeSearch = async (filtersForRequest, searchSource = source, targetPage = page, limit = pageSize) => {
+    const payload = {
+      source: searchSource,
+      filters: filtersForRequest,
+      page: targetPage,
+      pageSize: limit,
+    };
+
+    logDebug('executeSearch:start', payload);
     setLoading(true);
     setError('');
 
-    fetch(`${API}/api/logs/search`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        source,
-        filters: query,
-        page,
-        pageSize,
-      }),
-      signal: ctrl.signal,
-    })
-      .then(async (r) => {
-        const j = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(j.error || `Request failed (${r.status})`);
-        setResult(j);
-      })
-      .catch((e) => {
-        if (e.name !== 'AbortError') {
-          setError(e.message);
-          setResult(null);
-        }
-      })
-      .finally(() => setLoading(false));
+    const controller = new AbortController();
+    try {
+      const response = await fetch(`${API}/api/logs/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
 
-    return () => ctrl.abort();
-  }, [query, source, page, pageSize]);
+      const rawText = await response.text();
+      logDebug('executeSearch:response', {
+        status: response.status,
+        ok: response.ok,
+        preview: rawText.slice(0, 500),
+      });
+
+      let json;
+      try {
+        json = rawText ? JSON.parse(rawText) : {};
+      } catch (parseError) {
+        throw new Error(`Invalid JSON from backend: ${parseError.message}`);
+      }
+
+      if (!response.ok) {
+        throw new Error(json.error || `Request failed (${response.status})`);
+      }
+
+      setResult(json);
+      logDebug('executeSearch:success', {
+        total: json?.pagination?.total,
+        dataLength: json?.data?.length || 0,
+        source: searchSource,
+      });
+      return json;
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        console.error('[LogSphere] executeSearch:error', e);
+        setError(e.message || 'Search failed');
+        setResult(null);
+      }
+      return null;
+    } finally {
+      setLoading(false);
+      logDebug('executeSearch:end');
+    }
+  };
 
   // Determine available fields based on selected source mode
   const currentAvailableFields = useMemo(() => {
@@ -210,23 +238,35 @@ export default function App() {
     }
     setFilters([newRow(field, value)]);
     setPage(1);
-    setQuery([{ field, value }]);
+    const presetFilters = [{ field, value }];
+    logDebug('applyPreset', { field, value, source: targetSource || source });
+    executeSearch(presetFilters, targetSource || source, 1, pageSize);
   };
 
   // Submit search
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    setPage(1);
+    const nextPage = 1;
+    setPage(nextPage);
     const validFilters = filters
       .map(({ field, value }) => ({ field, value: value.trim() }))
       .filter(({ field, value }) => field && value);
 
+    logDebug('handleSubmit', {
+      rawFilters: filters,
+      validFilters,
+      source,
+      page: nextPage,
+      pageSize,
+    });
+
     if (validFilters.length === 0) {
       setError('Please provide a search value');
+      logDebug('handleSubmit:empty', { filters });
       return;
     }
 
-    setQuery(validFilters);
+    await executeSearch(validFilters, source, nextPage, pageSize);
   };
 
   // Flatten rows and organize columns

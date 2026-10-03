@@ -14,6 +14,7 @@ const {
   buildFilterQuery,
   buildOBMQFilterQuery,
   buildOBMQQuery,
+  escapeQueryValue,
   ValidationError,
 } = require('./queryMap');
 
@@ -23,8 +24,8 @@ const ES_URL = (
   process.env.ES_URL || 'http://localhost:9200'
 ).replace(/\/+$/, '');
 
-// Existing/main log index
-const ES_INDEX = process.env.ES_INDEX || 'custom-logs';
+// Logstash output index; override with ES_INDEX for another deployment.
+const ES_INDEX = process.env.ES_INDEX || 'syngenta-message-logs';
 
 // New OBMQ log index
 const OBMQ_INDEX = process.env.OBMQ_INDEX || 'obmq-logs';
@@ -76,6 +77,11 @@ function esHeaders() {
    ========================================================= */
 
 async function esSearch(index, body) {
+  console.debug('[LogSphere][backend] esSearch:request', {
+    index,
+    bodyPreview: JSON.stringify(body).slice(0, 500),
+  });
+
   let res;
 
   try {
@@ -102,13 +108,77 @@ async function esSearch(index, body) {
 
   if (!res.ok) {
     const reason = json?.error?.reason || res.statusText;
+    console.debug('[LogSphere][backend] esSearch:error', { status: res.status, reason });
     throw new HttpError(
       502,
       `Elasticsearch error (${res.status}): ${reason}`
     );
   }
 
+  console.debug('[LogSphere][backend] esSearch:success', {
+    index,
+    totalHits: json?.hits?.total?.value || 0,
+    took: json?.took,
+  });
+
   return json;
+}
+
+function buildFallbackQuery(filters) {
+  if (!filters || !filters.length) {
+    return { match_all: {} };
+  }
+
+  return {
+    bool: {
+      must: filters.map((filter) => ({
+        query_string: {
+          query: `"${escapeQueryValue(String(filter.value).trim())}"`,
+          fields: ['*'],
+          lenient: true,
+          analyze_wildcard: true,
+          default_operator: 'AND',
+        },
+      })),
+    },
+  };
+}
+
+async function esSearchWithFallback(index, filters, body, primaryQueryFactory) {
+  const primaryQuery = primaryQueryFactory(filters);
+  console.debug('[LogSphere][backend] esSearchWithFallback:primary', {
+    index,
+    queryPreview: JSON.stringify(primaryQuery).slice(0, 500),
+  });
+
+  const primaryResult = await esSearch(index, {
+    ...body,
+    query: primaryQuery,
+  });
+
+  if ((primaryResult.hits?.total?.value || 0) > 0) {
+    console.debug('[LogSphere][backend] esSearchWithFallback:primary-hit', {
+      index,
+      totalHits: primaryResult.hits.total.value,
+    });
+    return primaryResult;
+  }
+
+  const fallbackQuery = buildFallbackQuery(filters);
+  if (JSON.stringify(fallbackQuery) === JSON.stringify(primaryQuery)) {
+    console.debug('[LogSphere][backend] esSearchWithFallback:no-fallback-needed', { index });
+    return primaryResult;
+  }
+
+  console.debug('[LogSphere][backend] esSearchWithFallback:retrying', {
+    index,
+    fallbackQueryPreview: JSON.stringify(fallbackQuery).slice(0, 500),
+  });
+
+  return esSearch(index, {
+    ...body,
+    query: fallbackQuery,
+  });
 }
 
 /* =========================================================
@@ -179,6 +249,7 @@ function parseFilter(f, i, total) {
 
 function parseRequest(body) {
   body = body || {};
+  console.debug('[LogSphere][backend] parseRequest:input', body);
 
   let raw;
   if (Array.isArray(body.filters)) {
@@ -225,12 +296,15 @@ function parseRequest(body) {
     );
   }
 
-  return {
+  const parsed = {
     filters,
     source,
     page,
     pageSize,
   };
+
+  console.debug('[LogSphere][backend] parseRequest:parsed', parsed);
+  return parsed;
 }
 
 /* =========================================================
@@ -293,6 +367,7 @@ app.get('/api/logs/stats', async (_req, res) => {
 
 app.post('/api/logs/search', async (req, res, next) => {
   try {
+    console.debug('[LogSphere][backend] /api/logs/search:request', req.body);
     const { filters, source, page, pageSize } = parseRequest(req.body);
 
     let mainData = [];
@@ -308,22 +383,25 @@ app.post('/api/logs/search', async (req, res, next) => {
      */
     if (source === 'all' || source === 'custom') {
       try {
-        const query = buildFilterQuery(filters);
-        const mainResult = await esSearch(ES_INDEX, {
-          from: (page - 1) * pageSize,
-          size: pageSize,
-          track_total_hits: true,
-          query,
-          sort: [
-            {
-              LogStart: {
-                order: 'desc',
-                unmapped_type: 'date',
-                missing: '_last',
+        const mainResult = await esSearchWithFallback(
+          ES_INDEX,
+          filters,
+          {
+            from: (page - 1) * pageSize,
+            size: pageSize,
+            track_total_hits: true,
+            sort: [
+              {
+                LogStart: {
+                  order: 'desc',
+                  unmapped_type: 'date',
+                  missing: '_last',
+                },
               },
-            },
-          ],
-        });
+            ],
+          },
+          buildFilterQuery
+        );
 
         mainData = (mainResult.hits?.hits || []).map((h) => ({
           _id: h._id,
@@ -347,22 +425,25 @@ app.post('/api/logs/search', async (req, res, next) => {
      */
     if (source === 'all' || source === 'obmq') {
       try {
-        const query = buildOBMQFilterQuery(filters);
-        const obmqResult = await esSearch(OBMQ_INDEX, {
-          from: (page - 1) * pageSize,
-          size: pageSize,
-          track_total_hits: true,
-          query,
-          sort: [
-            {
-              CreatedDate: {
-                order: 'desc',
-                unmapped_type: 'date',
-                missing: '_last',
+        const obmqResult = await esSearchWithFallback(
+          OBMQ_INDEX,
+          filters,
+          {
+            from: (page - 1) * pageSize,
+            size: pageSize,
+            track_total_hits: true,
+            sort: [
+              {
+                CreatedDate: {
+                  order: 'desc',
+                  unmapped_type: 'date',
+                  missing: '_last',
+                },
               },
-            },
-          ],
-        });
+            ],
+          },
+          buildOBMQFilterQuery
+        );
 
         obmqData = (obmqResult.hits?.hits || []).map((h) => ({
           _id: h._id,
@@ -408,6 +489,14 @@ app.post('/api/logs/search', async (req, res, next) => {
         combinedData = combinedData.slice(0, pageSize);
       }
     }
+
+    console.debug('[LogSphere][backend] /api/logs/search:response', {
+      source,
+      total,
+      resultCount: combinedData.length,
+      mainTotal,
+      obmqTotal,
+    });
 
     res.json({
       data: combinedData,

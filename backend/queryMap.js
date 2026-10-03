@@ -224,17 +224,97 @@ const BUILDERS = {
 /* =========================================================
    BUILD CLAUSE FOR CUSTOM LOGS
    ========================================================= */
-function buildCustomQuery(field, value) {
-  if (!CUSTOM_FIELDS[field]) {
-    // If not a predefined custom field, check if it's in ALL_FIELDS or general
-    if (!ALL_FIELDS[field]) {
-      throw new ValidationError(`Unsupported field for Custom Logs: ${String(field).slice(0, 60)}`);
-    }
-    // Fall back to keyword match
-    return { match_phrase: { [field]: value } };
+function escapeWildcardValue(value) {
+  return String(value).replace(/[\\*?\[\]]/g, '\\$&');
+}
+
+function isIdentifierLike(value) {
+  const v = String(value).trim();
+  if (!v || v.length < 6 || v.length > 128) return false;
+
+  const hasAlpha = /[A-Za-z]/.test(v);
+  const hasDigit = /\d/.test(v);
+  const hasSeparator = /[_\-/.]/.test(v);
+
+  return (hasAlpha && hasDigit) || hasSeparator || v.length >= 18;
+}
+
+function buildFlexibleQuery(field, value, type = 'keyword') {
+  const normalized = String(value).trim();
+  if (!normalized) return { match_all: {} };
+
+  const exactQuery = BUILDERS[type]
+    ? BUILDERS[type](field, normalized)
+    : { match_phrase: { [field]: normalized } };
+
+  if (!isIdentifierLike(normalized)) {
+    return exactQuery;
   }
 
-  const q = BUILDERS[CUSTOM_FIELDS[field]](field, value);
+  return {
+    bool: {
+      should: [
+        exactQuery,
+        { wildcard: { [field]: `*${escapeWildcardValue(normalized)}*` } },
+        {
+          query_string: {
+            query: `"${escapeQueryValue(normalized)}"`,
+            fields: [field],
+            lenient: true,
+            analyze_wildcard: true,
+          },
+        },
+      ],
+      minimum_should_match: 1,
+    },
+  };
+}
+
+function buildCustomQuery(field, value) {
+  if (!CUSTOM_FIELDS[field]) {
+    const exactFieldClause = ALL_FIELDS[field]
+      ? buildFlexibleQuery(field, value, ALL_FIELDS[field])
+      : null;
+
+    const broadMatchClause = {
+      bool: {
+        should: [
+          {
+            query_string: {
+              query: `"${escapeQueryValue(value)}"`,
+              fields: ['*'],
+              lenient: true,
+              analyze_wildcard: true,
+            },
+          },
+          {
+            wildcard: {
+              '*': `*${escapeWildcardValue(value)}*`,
+            },
+          },
+        ],
+        minimum_should_match: 1,
+      },
+    };
+
+    // Try the exact field first, but if it's a cross-log identifier not present on the custom side,
+    // allow the broad document match to succeed so shared IDs can correlate across both indices.
+    if (!ALL_FIELDS[field]) {
+      return broadMatchClause;
+    }
+
+    return {
+      bool: {
+        should: [
+          exactFieldClause,
+          broadMatchClause,
+        ],
+        minimum_should_match: 1,
+      },
+    };
+  }
+
+  const q = buildFlexibleQuery(field, value, CUSTOM_FIELDS[field]);
   const root = field.split('.')[0];
 
   return field.includes('.') && NESTED_PATHS[root]
@@ -272,16 +352,29 @@ function buildFilterQuery(filters) {
 function buildOBMQQueryClause(field, value) {
   const type = OBMQ_FIELDS[field];
   if (type && BUILDERS[type]) {
-    return BUILDERS[type](field, value);
+    return buildFlexibleQuery(field, value, type);
   }
 
   // If the field isn't an explicit OBMQ field (e.g. user selected custom field in cross-search),
   // search the value across all fields in OBMQ:
   return {
-    query_string: {
-      query: `"${escapeQueryValue(value)}"`,
-      fields: ['*'],
-      lenient: true,
+    bool: {
+      should: [
+        {
+          query_string: {
+            query: `"${escapeQueryValue(value)}"`,
+            fields: ['*'],
+            lenient: true,
+            analyze_wildcard: true,
+          },
+        },
+        {
+          wildcard: {
+            '*': `*${escapeWildcardValue(value)}*`,
+          },
+        },
+      ],
+      minimum_should_match: 1,
     },
   };
 }

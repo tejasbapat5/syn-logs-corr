@@ -29,6 +29,8 @@ Filters are combined with **AND** (max 10). The old `{ "field", "value" }` shape
 ## UI
 Use **+** to add another field/value row and **−** to remove one. A field already used in one row is hidden from the other dropdowns.
 
-## Customising
-Edit `backend/queryMap.js` (KEYWORD / DATE / BOOLEAN lists, `NESTED_PATHS`). The frontend never sends raw ES queries.
-ES index names must be lowercase – set `ES_INDEX` to your real index name.
+## Elasticsearch
+The backend queries `syngenta-message-logs` by default, matching the index configured in the Logstash pipeline. Set `ES_INDEX` to override it for another deployment. Set `OBMQ_INDEX` if OBMQ logs are stored in a different index. The frontend sends field/value filters; the backend builds the Elasticsearch query and returns the matching documents.
+
+## Customising searchable fields
+Edit `backend/queryMap.js` (KEYWORD / DATE / BOOLEAN lists, `NESTED_PATHS`). The frontend never sends raw Elasticsearch queries.
